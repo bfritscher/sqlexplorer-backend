@@ -1,6 +1,6 @@
 var express = require('express');
 var bodyParser = require('body-parser');
-var pg = require('pg');
+var Pool = require('pg').Pool;
 var oracledb = require('oracledb');
 var app = express();
 var cors = require('cors');
@@ -9,19 +9,22 @@ var xmlBuilder = require('xmlbuilder');
 var AdmZip = require('adm-zip');
 var exec = require("child_process").exec;
 var tmp = require('tmp');
-var raven = require('raven');
+var Raven = require('raven');
 
-var pgConString = "postgres://sqlexplorer:pwd@localhost/sqlexplorer"
-var pgConAdminString = "postgres://sqlexplorer_admin:pwd@localhost/sqlexplorer"
+var pgConString = "postgres://login:pass@localhost/sqlexplorer"
+var pgConAdminString = "postgres://login_pass@localhost/sqlexplorer"
 var oraclePool;
+var pgPool = new Pool({connectionString: pgConString});
+var pgAdminPool = new Pool({connectionString: pgConAdminString});
+pgPool.on('error', function (err, client) {
+   Raven.captureException(err);
+});
 
 var SENTRY_DSN = '';
-app.use(raven.middleware.express.requestHandler(SENTRY_DSN));
-var client = new raven.Client(SENTRY_DSN);
-client.patchGlobal(function(sent, err) {
-  console.log(err.stack);
-  process.exit(1);
-});
+
+Raven.config(SENTRY_DSN).install();
+app.use(Raven.requestHandler());
+app.use(Raven.errorHandler());
 
 var passport = require('passport')
   , BasicStrategy = require('passport-http').BasicStrategy;
@@ -44,7 +47,6 @@ app.use(express.static('public'));
 app.use(express.static('schema_pics'));
 app.use(passport.initialize());
 
-app.use(raven.middleware.express.errorHandler(SENTRY_DSN));
 
 var jsonParser = bodyParser.json()
 var txtParser = bodyParser.text();
@@ -61,15 +63,18 @@ app.post('/api/evaluate', jsonParser, function (req, res) {
 //regexp_replace(regexp_replace(substring(sql from '^SELECT *(?:DISTINCT)? *(.*?) *FROM.*?'), ', .*? AS ',', ','gs'), '^.*? AS ', '', 'gs')
 
 app.get('/api/questiontext/:id', function(req, res){
-	pg.connect(pgConString, function(err, client, done){
+	pgPool.connect(function(err, client, done){
 		if(err){
-		  return console.error('error fetching client from pool', err);
+		  console.error('error fetching client from pool', err);
+		  Raven.captureException(err);
+		  return;
 		}
 		client.query('SELECT * FROM question_schemas WHERE id = $1',
 			  [req.params.id], function(err, result) {
 			  if(err) {
-          console.error('error running query', err);
-          res.sendStatus(500);
+				console.error('error running query', err);
+				Raven.captureException(err);
+				res.sendStatus(500);
 			  }
 			  if(result.rows.length > 0){
           res.write(JSON.stringify(result.rows[0]));
@@ -86,20 +91,23 @@ app.get('/api/question/:id',
     passport.authenticate('basic', { session: false }),
     function(req, res){
   //TODO check admin
-	pg.connect(pgConString, function(err, client, done){
+	pgPool.connect(function(err, client, done){
 		if(err){
-		  return console.error('error fetching client from pool', err);
+		  console.error('error fetching client from pool', err);
+		  Raven.captureException(err);
+		  return;
 		}
 		client.query('SELECT q.*, qv.schema FROM questions q JOIN question_schemas qv ON qv.id = q.id  WHERE q.id = $1',
 			  [req.params.id], function(err, result) {
 			  if(err) {
-          console.error('error running query', err);
-          res.sendStatus(500);
+				console.error('error running query', err);
+				Raven.captureException(err);
+				res.sendStatus(500);
 			  }
 			  if(result.rows.length > 0){
-          res.write(JSON.stringify(result.rows[0]));
+				res.write(JSON.stringify(result.rows[0]));
 			  }else{
-          res.sendStatus(404);
+				res.sendStatus(404);
 			  }
 			  res.end();
 			  done();
@@ -121,14 +129,17 @@ app.get('/api/scorm/:id',
         if(isNaN(req.params.id)){
           createScorm(req, res, [{id:req.params.id}]);
         }else{
-          pg.connect(pgConString, function(err, client, done){
+          pgPool.connect(function(err, client, done){
               if(err){
-                return console.error('error fetching client from pool', err);
+                console.error('error fetching client from pool', err);
+				Raven.captureException(err);
+				return;
               }
               client.query('SELECT question_id AS id FROM assignment_questions WHERE assignment_id = $1 ORDER BY aq_order ASC',
                     [req.params.id], function(err, result) {
                     if(err) {
                       console.error('error running query', err);
+					  Raven.captureException(err);
                       res.sendStatus(500);
                     }
                     if(result.rows.length > 0){
@@ -146,9 +157,10 @@ app.get('/api/scorm/:id',
 app.get('/api/logs',
     passport.authenticate('basic', { session: false }),
     function(req, res){
-      pg.connect(pgConString, function(err, client, done){
+      pgPool.connect(function(err, client, done){
           if(err){
-            return console.error('error fetching client from pool', err);
+            console.error('error fetching client from pool', err);
+			Raven.captureException(err);
           }
           client.query('SELECT json_agg(row_to_json(t)) AS json \
 FROM (SELECT user_name, user_id, json_agg((SELECT row_to_json( _ ) FROM (SELECT activity as name, questions) _ )) as activities \
@@ -166,6 +178,7 @@ FROM (SELECT user_name, user_id, json_agg((SELECT row_to_json( _ ) FROM (SELECT 
                 function(err, result) {
                 if(err) {
                   console.error('error running query', err);
+				  Raven.captureException(err);
                   res.sendStatus(500);
                 }
                 if(result.rows.length > 0){
@@ -183,9 +196,11 @@ FROM (SELECT user_name, user_id, json_agg((SELECT row_to_json( _ ) FROM (SELECT 
 app.get('/api/logs/:user_id',
     passport.authenticate('basic', { session: false }),
     function(req, res){
-      pg.connect(pgConString, function(err, client, done){
+      pgPool.connect(function(err, client, done){
           if(err){
-            return console.error('error fetching client from pool', err);
+            console.error('error fetching client from pool', err);
+			Raven.captureException(err);
+			return;
           }
           client.query('SELECT activity, question_id, COUNT(*), json_agg((SELECT row_to_json(_) FROM (SELECT query, error, created, ip) _ )) AS attempts \
 FROM logs \
@@ -194,6 +209,7 @@ GROUP BY activity, question_id ORDER BY activity, question_id',
                 [req.params.user_id], function(err, result) {
                 if(err) {
                   console.error('error running query', err);
+				  Raven.captureException(err);
                   res.sendStatus(500);
                 }
                 if(result.rows.length > 0){
@@ -248,9 +264,11 @@ function createScorm(req, res, rows){
 app.get('/api/tags',
     passport.authenticate('basic', { session: false }),
     function(req, res){
-      pg.connect(pgConAdminString, function(err, client, done){
+      pgAdminPool.connect(function(err, client, done){
           if(err){
-            return console.error('error fetching client from pool', err);
+            console.error('error fetching client from pool', err);
+			Raven.captureException(err);
+			return;
           }
           client.query("SELECT name, Count(q.id) AS nb \
   FROM keywords k \
@@ -260,6 +278,7 @@ ORDER BY name",
                 function(err, result) {
                 if(err) {
                   console.error('error running query', err);
+				  Raven.captureException(err);
                   res.sendStatus(500);
                 }
                 if(result.rows.length > 0){
@@ -277,9 +296,11 @@ ORDER BY name",
 app.get('/api/assignment/list',
     passport.authenticate('basic', { session: false }),
     function(req, res){
-      pg.connect(pgConAdminString, function(err, client, done){
+      pgAdminPool.connect(function(err, client, done){
           if(err){
-            return console.error('error fetching client from pool', err);
+            console.error('error fetching client from pool', err);
+			Raven.captureException(err);
+			return;
           }
           client.query("SELECT a.id, a.name, a.year, a.course, a.description, COUNT(aq.assignment_id) AS nb \
                  FROM assignments a LEFT JOIN assignment_questions aq ON a.id = aq.assignment_id \
@@ -287,6 +308,7 @@ app.get('/api/assignment/list',
                 function(err, result) {
                 if(err) {
                   console.error('error running query', err);
+				  Raven.captureException(err);
                   res.sendStatus(500);
                 }
                   res.write(JSON.stringify(result.rows))
@@ -303,6 +325,7 @@ app.get('/api/assignment/:id',
         getAssignmentQuestions(req.params.id, function(err, result) {
             if(err) {
               console.error('error running query', err);
+			  Raven.captureException(err);
               res.sendStatus(500);
             }
             res.write(JSON.stringify(result.rows))
@@ -312,9 +335,11 @@ app.get('/api/assignment/:id',
 );
 
 function getAssignmentQuestions(id, callback){
-    pg.connect(pgConAdminString, function(err, client, done){
+    pgAdminPool.connect(function(err, client, done){
         if(err){
-            return console.error('error fetching client from pool', err);
+            console.error('error fetching client from pool', err);
+			Raven.captureException(err);
+			return;
         }
         client.query("SELECT * FROM assignment_questions aq JOIN questions q ON q.id = question_id WHERE aq.assignment_id = $1 ORDER BY aq.aq_order",
             [id],
@@ -326,9 +351,11 @@ function getAssignmentQuestions(id, callback){
 }
 
 function getAssignementById(id, callback){
-    pg.connect(pgConAdminString, function(err, client, done){
+    pgAdminPool.connect(function(err, client, done){
         if(err){
-            return console.error('error fetching client from pool', err);
+            console.error('error fetching client from pool', err);
+			Raven.captureException(err);
+			return;
         }
         client.query("SELECT * FROM assignments WHERE id = $1",
             [id],
@@ -342,7 +369,7 @@ function getAssignementById(id, callback){
 app.post('/api/assignment', jsonParser,
     passport.authenticate('basic', { session: false }),
     function(req, res){
-        pg.connect(pgConAdminString, function(err, client, done){
+        pgAdminPool.connect(function(err, client, done){
             if(err){
                 console.error('error fetching client from pool', err);
                 res.sendStatus(500);
@@ -368,9 +395,10 @@ app.post('/api/assignment', jsonParser,
 app.post('/api/assignment/:assignmentId/question', jsonParser,
     passport.authenticate('basic', { session: false }),
     function(req, res){
-        pg.connect(pgConAdminString, function(err, client, done){
+        pgAdminPool.connect(function(err, client, done){
             if(err){
                 console.error('error fetching client from pool', err);
+				Raven.captureException(err);
                 res.sendStatus(500);
                 return;
             }
@@ -378,6 +406,7 @@ app.post('/api/assignment/:assignmentId/question', jsonParser,
                 [req.params.assignmentId, req.body.questionId], function(err, result) {
               if(err) {
                 console.error('error running query', err);
+				Raven.captureException(err);
                 res.sendStatus(500);
                 return;
               }
@@ -392,9 +421,11 @@ app.post('/api/questions', jsonParser,
     passport.authenticate('basic', { session: false }),
     function (req, res) {
         if (!req.body) return res.sendStatus(400);
-        pg.connect(pgConAdminString, function(err, client, done){
+        pgAdminPool.connect(function(err, client, done){
           if(err){
-            return console.error('error fetching client from pool', err);
+            console.error('error fetching client from pool', err);
+			Raven.captureException(err);
+			return;
           }
           var keywords = req.body.keywords || [];
           var dbname = req.body.dbname || 'ALL';
@@ -431,6 +462,7 @@ app.post('/api/questions', jsonParser,
                 function(err, result) {
                 if(err) {
                   console.error('error running query', err);
+				  Raven.captureException(err);
                   res.sendStatus(500);
                 }
                 if(result.rows){
@@ -553,6 +585,7 @@ function query(req, res) {
 					connection.release(function(err) {
                         if (err) {
                             console.error(err.message);
+							Raven.captureException(err);
                         }
                     }); // call only when query is finished executing
 					res.end();
@@ -563,6 +596,7 @@ function query(req, res) {
                     connection.release(function(err) {
                         if (err) {
                             console.error(err.message);
+							Raven.captureException(err);
                         }
                     });
 					res.end();
@@ -587,6 +621,7 @@ function query(req, res) {
                                     connection.release(function(err) {
                                         if (err) {
                                             console.error(err.message);
+											Raven.captureException(err);
                                         }
                                     });
                                     res.sendStatus(500);
@@ -658,11 +693,13 @@ function getDBList(req, res) {
 			connection.release(function(err) {
         if (err) {
           console.error(err.message);
+		  Raven.captureException(err);
         }
       });
       connection.release(function(err) {
             if (err) {
               console.error(err.message);
+			  Raven.captureException(err);
             }
           });
       res.end();
@@ -762,6 +799,7 @@ r_column_name 11
           connection.release(function(err) {
             if (err) {
               console.error(err.message);
+			  Raven.captureException(err);
             }
           });
 					res.end();
@@ -851,14 +889,17 @@ function str_replace(search, replace, subject, count) {
 
 
 function getQuestionByID(id, callback){
-	pg.connect(pgConString, function(err, client, done){
+	pgPool.connect(function(err, client, done){
 		if(err){
-		  return console.error('error fetching client from pool', err);
+		  console.error('error fetching client from pool', err);
+		  Raven.captureException(err);
+		  return;
 		}
 		client.query('SELECT * FROM questions WHERE id = $1',
 			  [id], function(err, result) {
 			  if(err) {
 				console.error('error running query', err);
+				Raven.captureException(err);
 			  }
 			  if(result.rows.length > 0){
 				callback(result.rows[0]);
@@ -869,14 +910,17 @@ function getQuestionByID(id, callback){
 }
 
 function logAnswer(log){
-	pg.connect(pgConString, function(err, client, done){
+	pgPool.connect(function(err, client, done){
 		if(err){
-		  return console.error('error fetching client from pool', err);
+		  console.error('error fetching client from pool', err);
+		  Raven.captureException(err);
+		  return;
 		}
 		client.query('INSERT INTO logs (activity, question_id, query, error, user_id, user_name, ip, created) VALUES($1,$2,$3,$4,$5,$6,$7, NOW())',
 			  [log.activity, log.question_id, log.query, log.error, log.user_id, log.user_name, log.ip], function(err, result) {
 			  if(err) {
 				console.error('error running query', err);
+				Raven.captureException(err);
 			  }
 			  done();
 		});
@@ -884,11 +928,12 @@ function logAnswer(log){
 }
 
 function upsertQuestion(req, res, question){
-	pg.connect(pgConAdminString, function(err, client, done){
+	pgAdminPool.connect(function(err, client, done){
 		if(err){
 		  console.error('error fetching client from pool', err);
-      res.sendStatus(500);
-      return;
+		  Raven.captureException(err);
+		  res.sendStatus(500);
+          return;
 		}
     //TODO check valid question first?
 
@@ -898,6 +943,7 @@ function upsertQuestion(req, res, question){
           [question.id, question.text, question.sql], function(err, result) {
           if(err) {
             console.error('error running query', err);
+			Raven.captureException(err);
             res.sendStatus(500);
             return;
           }
@@ -913,6 +959,7 @@ function upsertQuestion(req, res, question){
           [question.db_schema, question.text, question.sql], function(err, result) {
           if(err) {
             console.error('error running query', err);
+			Raven.captureException(err);
             res.sendStatus(500);
             return;
           }
