@@ -503,7 +503,9 @@ function query(req, res) {
         }
 		connection.execute('ALTER SESSION SET CURRENT_SCHEMA="'+ schema +'"', [], function(err, results) {
 			if (err) { console.log('Error executing query:', err); res.sendStatus(500); return; }
-
+      if (!req.body.sql) {
+        return res.sendStatus(404);
+      }
 			var sqlToTest = req.body.sql.replace(/;/g, '');
 
 			connection.execute(sqlToTest, [], function(err, results) {
