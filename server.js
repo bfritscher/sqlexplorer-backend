@@ -12,7 +12,7 @@ var tmp = require('tmp');
 var Raven = require('raven');
 
 var pgConString = "postgres://login:pass@localhost/sqlexplorer"
-var pgConAdminString = "postgres://login_pass@localhost/sqlexplorer"
+var pgConAdminString = "postgres://login:pass@localhost/sqlexplorer"
 var oraclePool;
 var pgPool = new Pool({connectionString: pgConString});
 var pgAdminPool = new Pool({connectionString: pgConAdminString});
